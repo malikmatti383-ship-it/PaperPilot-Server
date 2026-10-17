@@ -22,6 +22,7 @@ const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
+const jazzcash = require('./jazzcash');
 
 // ---------------------------------------------------------------- env
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -30,6 +31,17 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
 const SERVER_URL = (process.env.SERVER_URL || '').replace(/\/$/, '');
 const PWA_URL = (process.env.PWA_URL || 'https://malikmatti383-ship-it.github.io/Paper-Stock/').replace(/\/$/, '');
+
+// JazzCash (optional — payments disabled until these are set)
+const JC = {
+  merchantId: process.env.JAZZCASH_MERCHANT_ID || '',
+  password: process.env.JAZZCASH_PASSWORD || '',
+  integritySalt: process.env.JAZZCASH_INTEGRITY_SALT || '',
+  sandbox: (process.env.JAZZCASH_SANDBOX || 'true') !== 'false',
+};
+const JC_POST_URL = JC.sandbox ? jazzcash.SANDBOX_POST_URL : jazzcash.PROD_POST_URL;
+const JC_CONFIGURED = Boolean(JC.merchantId && JC.password && JC.integritySalt && SERVER_URL);
+if (!JC_CONFIGURED) console.warn('[config] JazzCash not configured — /api/pay/* will return 503.');
 
 const SESSION_DAYS = 365;
 
@@ -110,10 +122,11 @@ app.use(cors({
   },
 }));
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: false })); // JazzCash posts its result as a form
 
 // ---------------------------------------------------------------- db
 const mongo = new MongoClient(MONGODB_URI);
-let db, users, sessions, syncdata;
+let db, users, sessions, syncdata, payments;
 
 async function initDb() {
   await mongo.connect();
@@ -121,12 +134,15 @@ async function initDb() {
   users = db.collection('users');
   sessions = db.collection('sessions');
   syncdata = db.collection('syncdata');
+  payments = db.collection('payments');
   await users.createIndex({ googleId: 1 }, { unique: true });
   await sessions.createIndex({ tokenHash: 1 }, { unique: true });
   await sessions.createIndex({ userId: 1 });
   // auto-remove expired sessions (best effort; middleware also checks expiry)
   await sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   await syncdata.createIndex({ userId: 1 }, { unique: true });
+  await payments.createIndex({ txnRefNo: 1 }, { unique: true });
+  await payments.createIndex({ userId: 1 });
   console.log('[db] connected, indexes ready');
 }
 
@@ -203,9 +219,9 @@ app.get('/auth/google/callback', async (req, res) => {
 });
 
 app.get('/api/me', auth, async (req, res) => {
-  const u = await users.findOne({ _id: new ObjectId(req.userId) }, { projection: { email: 1, name: 1, picture: 1, plan: 1 } });
+  const u = await users.findOne({ _id: new ObjectId(req.userId) }, { projection: { email: 1, name: 1, picture: 1, plan: 1, planExpiresAt: 1 } });
   if (!u) return res.status(404).json({ error: 'user not found' });
-  res.json({ email: u.email, name: u.name, picture: u.picture, plan: u.plan || 'free' });
+  res.json({ email: u.email, name: u.name, picture: u.picture, plan: u.plan || 'free', planExpiresAt: u.planExpiresAt || null });
 });
 
 app.get('/api/data', auth, async (req, res) => {
@@ -230,6 +246,76 @@ app.post('/api/logout', auth, async (req, res) => {
   const h = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
   await sessions.deleteOne({ tokenHash: sha256hex(h) });
   res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------- JazzCash payments
+// Plans are one-time purchases (no auto-renew): expiry = now + plan days.
+app.post('/api/pay/create', auth, async (req, res) => {
+  try {
+    if (!JC_CONFIGURED) return res.status(503).json({ error: 'payments not configured' });
+    const { plan } = req.body || {};
+    const p = jazzcash.PLANS[plan];
+    if (!p) return res.status(400).json({ error: 'unknown plan' });
+
+    const txnRefNo = jazzcash.makeTxnRefNo();
+    const fields = jazzcash.buildPaymentFields(
+      { merchantId: JC.merchantId, password: JC.password, integritySalt: JC.integritySalt, returnUrl: `${SERVER_URL}/api/pay/jazzcash/return` },
+      { amountRs: p.amountRs, billRef: txnRefNo, description: p.label, txnRefNo, userId: req.userId }
+    );
+    await payments.insertOne({
+      txnRefNo, userId: new ObjectId(req.userId), plan,
+      amountRs: p.amountRs, status: 'pending', createdAt: new Date(),
+    });
+    console.log('[pay] created', txnRefNo, plan);
+    res.json({ postUrl: JC_POST_URL, fields, txnRefNo, amountRs: p.amountRs });
+  } catch (e) {
+    console.error('[pay] create failed:', e.message);
+    res.status(500).json({ error: 'could not start payment' });
+  }
+});
+
+// JazzCash calls this (server-to-server form POST) after the user pays.
+// pp_ResponseCode "000" = success.
+app.post('/api/pay/jazzcash/return', async (req, res) => {
+  const b = req.body || {};
+  const okPage = (title, msg) =>
+    res.send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title></head>` +
+      `<body style="font-family:sans-serif;text-align:center;padding:48px 16px"><h2>${title}</h2><p>${msg}</p><p>App mein wapas jayein.</p></body></html>`);
+  try {
+    if (!jazzcash.verifyReturnHash(b, JC.integritySalt)) {
+      console.error('[pay] return hash mismatch for', b.pp_TxnRefNo);
+      return okPage('Tasdeeq nakaam', 'Payment ki tasdeeq nahi ho saki. Support se rabta karein.');
+    }
+    const pay = await payments.findOne({ txnRefNo: b.pp_TxnRefNo });
+    if (!pay) {
+      console.error('[pay] unknown txnRefNo', b.pp_TxnRefNo);
+      return okPage('Record nahi mila', 'Is payment ka record nahi mila. Support se rabta karein.');
+    }
+    if (pay.status === 'success') return okPage('Kamyab!', 'Premium pehle hi active ho chuka hai.');
+    if (String(b.pp_ResponseCode) === '000') {
+      const p = jazzcash.PLANS[pay.plan];
+      const expiresAt = new Date(Date.now() + p.days * 86400000);
+      await payments.updateOne({ _id: pay._id }, { $set: { status: 'success', paidAt: new Date(), ppResponse: String(b.pp_ResponseCode) } });
+      await users.updateOne({ _id: pay.userId }, { $set: { plan: 'premium', planExpiresAt: expiresAt } });
+      console.log('[pay] SUCCESS', pay.txnRefNo, pay.plan);
+      return okPage('Payment kamyab! 🎉', 'Premium active ho gaya hai.');
+    }
+    await payments.updateOne({ _id: pay._id }, { $set: { status: 'failed', ppResponse: String(b.pp_ResponseCode || ''), ppMessage: String(b.pp_ResponseMessage || '').slice(0, 200) } });
+    console.log('[pay] FAILED', pay.txnRefNo, b.pp_ResponseCode, b.pp_ResponseMessage);
+    return okPage('Payment nakaam', 'Dobara koshish karein.');
+  } catch (e) {
+    console.error('[pay] return handler error:', e.message);
+    return okPage('Error', 'Kuch ghalat ho gaya. Support se rabta karein.');
+  }
+});
+
+// App polls this while the user is on the JazzCash page.
+app.get('/api/pay/status', auth, async (req, res) => {
+  const txnRefNo = String(req.query.txnRefNo || '');
+  const pay = await payments.findOne({ txnRefNo, userId: new ObjectId(req.userId) });
+  if (!pay) return res.status(404).json({ error: 'payment not found' });
+  const u = await users.findOne({ _id: new ObjectId(req.userId) }, { projection: { plan: 1, planExpiresAt: 1 } });
+  res.json({ status: pay.status, plan: u ? (u.plan || 'free') : 'free', planExpiresAt: u ? (u.planExpiresAt || null) : null });
 });
 
 // ---------------------------------------------------------------- start

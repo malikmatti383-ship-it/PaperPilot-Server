@@ -7,7 +7,7 @@ Is server se hoga: Gmail login + har dukandar ka data cloud mein sync (5 devices
 1. github.com kholo → **+** → **New repository**
 2. Name: `PaperPilot-Server` → **Public** → **Create repository**
 3. **Add file** → **Upload files** → is folder ki saari files upload karo:
-   `package.json`, `server.js`, `.env.example`, `frontend-auth.js`
+   `package.json`, `server.js`, `jazzcash.js`, `.env.example`, `frontend-auth.js`
    (`.env.example` hi upload karna — kabhi `.env` asli secrets wali upload NA karna)
 4. **Commit changes** dabao
 
