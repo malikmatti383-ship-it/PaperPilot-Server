@@ -1,14 +1,20 @@
 /**
- * PaperPilot — owner email notifications (best effort).
+ * PaperPilot — mail sending (owner notifications + login codes).
  *
- * Sends mail via the owner's Gmail using an App Password (Gmail SMTP).
- * Config (Render env vars — secrets ONLY there, never in code or chat):
- *   OWNER_NOTIFY_EMAIL   recipient, e.g. the owner's Gmail
- *   GMAIL_USER           sender Gmail address
- *   GMAIL_APP_PASSWORD   16-char Gmail App Password for GMAIL_USER
+ * PRIMARY route: Brevo (https://api.brevo.com) over HTTPS, because Render
+ * blocks outbound SMTP connections entirely (ports 465 AND 587 timed out at
+ * connect time, verified 2026-10-21). Config (Render env vars — secrets ONLY
+ * there, never in code or chat):
+ *   BREVO_API_KEY        Brevo API key (xkeysib-...)
+ *   GMAIL_USER           sender Gmail address (must be a verified Brevo sender)
+ *   OWNER_NOTIFY_EMAIL   owner-notification recipient
  *
- * If any of these are missing, notifications are skipped with a log line —
- * payments and activations NEVER fail because email failed.
+ * FALLBACK route (local dev only): Gmail SMTP via App Password
+ * (GMAIL_USER + GMAIL_APP_PASSWORD).
+ *
+ * If mail is not configured, owner notifications are skipped with a log
+ * line — payments and activations NEVER fail because email failed. Login
+ * codes instead THROW, so a code is never stored that the user did not get.
  */
 'use strict';
 
@@ -25,7 +31,48 @@ function mailConfig() {
 
 function mailConfigured() {
   const c = mailConfig();
+  if (brevoKey()) return Boolean(c.to && senderEmail());
   return Boolean(c.to && c.user && c.pass);
+}
+
+function clean(v) { return String(v || '').trim(); }
+
+function brevoKey() { return clean(process.env.BREVO_API_KEY); }
+
+function senderEmail() {
+  return clean(process.env.GMAIL_USER) || clean(process.env.BREVO_SENDER);
+}
+
+// Brevo transactional email API — plain HTTPS, works from any host.
+async function sendViaBrevo({ to, subject, text }) {
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'api-key': brevoKey(),
+      'content-type': 'application/json',
+      accept: 'application/json',
+    },
+    body: JSON.stringify({
+      sender: { name: 'PaperPilot', email: senderEmail() },
+      to: [{ email: to }],
+      subject,
+      textContent: text,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error('Brevo send failed (' + res.status + '): ' + body.slice(0, 200));
+  }
+}
+
+// One delivery path for every mail this module sends.
+async function deliver({ to, subject, text }) {
+  if (brevoKey()) {
+    await sendViaBrevo({ to, subject, text });
+    return;
+  }
+  const c = mailConfig();
+  await getTransporter().sendMail({ from: `PaperPilot <${c.user}>`, to, subject, text });
 }
 
 function getTransporter() {
@@ -50,8 +97,9 @@ function getTransporter() {
   return transporter;
 }
 
-/** Sender-side check only (used by login codes): needs GMAIL_USER + APP PASSWORD. */
+/** Sender-side check only (used by login codes): Brevo key, or Gmail user + app password. */
 function mailSenderConfigured() {
+  if (brevoKey()) return Boolean(senderEmail());
   const c = mailConfig();
   return Boolean(c.user && c.pass);
 }
@@ -66,9 +114,7 @@ async function sendLoginCode(toEmail, code) {
     e.code = 'MAIL_NOT_CONFIGURED';
     throw e;
   }
-  const c = mailConfig();
-  await getTransporter().sendMail({
-    from: `PaperPilot <${c.user}>`,
+  await deliver({
     to: toEmail,
     subject: `PaperPilot login code: ${code}`,
     text: [
@@ -94,12 +140,7 @@ async function notifyOwner(subject, text) {
       return false;
     }
     const c = mailConfig();
-    await getTransporter().sendMail({
-      from: `PaperPilot <${c.user}>`,
-      to: c.to,
-      subject,
-      text,
-    });
+    await deliver({ to: c.to, subject, text });
     console.log('[mail] owner notified:', subject);
     return true;
   } catch (e) {
