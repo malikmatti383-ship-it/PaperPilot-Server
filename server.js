@@ -9,6 +9,16 @@
  *   GET  /api/data              (auth) -> { data, updatedAt }
  *   POST /api/data              (auth) -> upsert { data }, returns { updatedAt }
  *   POST /api/logout            (auth) -> delete session
+ *   GET  /api/pay/plans         -> plan list (from jazzcash.PLANS)
+ *   GET  /api/pay/manual/config (auth) -> manual payment numbers + plans
+ *   POST /api/pay/manual        (auth) -> user submits a manual payment (txn ID)
+ *   GET  /api/pay/manual/mine   (auth) -> user's own manual payment requests
+ *   GET  /api/admin/payments    (admin key) -> payment requests list
+ *   POST /api/admin/payments/:id/activate (admin key) -> activate premium
+ *   POST /api/admin/payments/:id/reject   (admin key) -> reject request
+ *   GET  /admin                 -> owner admin page (admin.html)
+ *   GET  /privacy               -> privacy policy page
+ *   GET  /terms                 -> terms of service page
  *
  * Security notes:
  * - Session tokens are 32 random bytes (hex). Only the SHA-256 hash is stored.
@@ -22,7 +32,9 @@ const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb');
+const path = require('path');
 const jazzcash = require('./jazzcash');
+const notify = require('./notify');
 
 // ---------------------------------------------------------------- env
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -42,6 +54,42 @@ const JC = {
 const JC_POST_URL = JC.sandbox ? jazzcash.SANDBOX_POST_URL : jazzcash.PROD_POST_URL;
 const JC_CONFIGURED = Boolean(JC.merchantId && JC.password && JC.integritySalt && SERVER_URL);
 if (!JC_CONFIGURED) console.warn('[config] JazzCash not configured — /api/pay/* will return 503.');
+
+// Manual payments (user sends money to the owner's own account — JazzCash,
+// Easypaisa, NayaPay, SadaPay or a bank account — and submits the transaction
+// ID in the app; owner approves in /admin).
+// The numbers are PUBLIC (customers must see them to pay) — set on Render.
+const MANUAL_PAY = {
+  jazzcashNumber: process.env.PAY_JAZZCASH_NUMBER || '',
+  jazzcashTitle: process.env.PAY_JAZZCASH_TITLE || '',
+  easypaisaNumber: process.env.PAY_EASYPAISA_NUMBER || '',
+  easypaisaTitle: process.env.PAY_EASYPAISA_TITLE || '',
+  nayapayNumber: process.env.PAY_NAYAPAY_NUMBER || '',
+  nayapayTitle: process.env.PAY_NAYAPAY_TITLE || '',
+  sadapayNumber: process.env.PAY_SADAPAY_NUMBER || '',
+  sadapayTitle: process.env.PAY_SADAPAY_TITLE || '',
+  bankName: process.env.PAY_BANK_NAME || '',
+  bankNumber: process.env.PAY_BANK_NUMBER || '', // account number or IBAN
+  bankTitle: process.env.PAY_BANK_TITLE || '',
+};
+
+/** Configured manual payment methods: [{ key, label, number, title }]. */
+function manualMethods() {
+  const list = [];
+  const add = (key, label, number, title) => { if (number) list.push({ key, label, number, title: title || '' }); };
+  add('jazzcash', 'JazzCash', MANUAL_PAY.jazzcashNumber, MANUAL_PAY.jazzcashTitle);
+  add('easypaisa', 'Easypaisa', MANUAL_PAY.easypaisaNumber, MANUAL_PAY.easypaisaTitle);
+  add('nayapay', 'NayaPay', MANUAL_PAY.nayapayNumber, MANUAL_PAY.nayapayTitle);
+  add('sadapay', 'SadaPay', MANUAL_PAY.sadapayNumber, MANUAL_PAY.sadapayTitle);
+  add('bank', MANUAL_PAY.bankName || 'Bank Transfer', MANUAL_PAY.bankNumber, MANUAL_PAY.bankTitle);
+  return list;
+}
+const MANUAL_CONFIGURED = manualMethods().length > 0;
+if (!MANUAL_CONFIGURED) console.warn('[config] Manual payment numbers not set — set PAY_JAZZCASH_NUMBER / PAY_EASYPAISA_NUMBER / PAY_NAYAPAY_NUMBER / PAY_SADAPAY_NUMBER / PAY_BANK_NUMBER.');
+
+// Owner admin (for /admin page + /api/admin/*). Long random secret, Render only.
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+if (!ADMIN_KEY) console.warn('[config] ADMIN_KEY not set — /api/admin/* will return 503.');
 
 const SESSION_DAYS = 365;
 
@@ -126,7 +174,7 @@ app.use(express.urlencoded({ extended: false })); // JazzCash posts its result a
 
 // ---------------------------------------------------------------- db
 const mongo = new MongoClient(MONGODB_URI);
-let db, users, sessions, syncdata, payments;
+let db, users, sessions, syncdata, payments, logincodes;
 
 async function initDb() {
   await mongo.connect();
@@ -135,6 +183,9 @@ async function initDb() {
   sessions = db.collection('sessions');
   syncdata = db.collection('syncdata');
   payments = db.collection('payments');
+  logincodes = db.collection('logincodes');
+  await logincodes.createIndex({ email: 1 }, { unique: true });
+  await logincodes.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   await users.createIndex({ googleId: 1 }, { unique: true });
   await sessions.createIndex({ tokenHash: 1 }, { unique: true });
   await sessions.createIndex({ userId: 1 });
@@ -165,10 +216,50 @@ async function auth(req, res, next) {
   }
 }
 
+// ---------------------------------------------------------------- admin + premium helpers
+function adminOnly(req, res, next) {
+  if (!ADMIN_KEY) return res.status(503).json({ error: 'admin not configured' });
+  const key = String(req.headers['x-admin-key'] || '');
+  const a = Buffer.from(key);
+  const b = Buffer.from(ADMIN_KEY);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: 'invalid admin key' });
+  }
+  next();
+}
+
+/**
+ * Sets plan=premium for a user. If the user is already premium and the plan
+ * has not expired yet, the new plan extends from the current expiry
+ * (renewals stack); otherwise it starts from now.
+ * Returns the new expiresAt Date.
+ */
+async function activatePremium(userId, planKey) {
+  const p = jazzcash.PLANS[planKey];
+  if (!p) throw new Error('unknown plan');
+  const u = await users.findOne({ _id: new ObjectId(userId) }, { projection: { plan: 1, planExpiresAt: 1 } });
+  const now = Date.now();
+  const current = u && u.plan === 'premium' && u.planExpiresAt && new Date(u.planExpiresAt).getTime() > now
+    ? new Date(u.planExpiresAt).getTime()
+    : now;
+  const expiresAt = new Date(current + p.days * 86400000);
+  await users.updateOne({ _id: new ObjectId(userId) }, { $set: { plan: 'premium', planExpiresAt: expiresAt } });
+  return expiresAt;
+}
+
+function publicPlans() {
+  return Object.entries(jazzcash.PLANS).map(([key, p]) => ({
+    key, amountRs: p.amountRs, days: p.days, label: p.label,
+  }));
+}
+
 // ---------------------------------------------------------------- routes
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
 app.get('/', (req, res) => res.send('PaperPilot API — ok. See /healthz'));
+
+app.get('/privacy', (req, res) => res.sendFile(path.join(__dirname, 'privacy.html')));
+app.get('/terms', (req, res) => res.sendFile(path.join(__dirname, 'terms.html')));
 
 app.get('/auth/google', (req, res) => {
   const redirectUri = `${SERVER_URL}/auth/google/callback`;
@@ -188,6 +279,13 @@ app.get('/auth/google/callback', async (req, res) => {
     if (!info.sub || !info.email) throw new Error('incomplete userinfo');
 
     const now = new Date();
+    // If this email already has an account (e.g. created via email-code
+    // login), attach the Google id to THAT account so the data stays unified.
+    const byGoogle = await users.findOne({ googleId: info.sub });
+    if (!byGoogle) {
+      const byEmail = await users.findOne({ email: info.email });
+      if (byEmail) await users.updateOne({ _id: byEmail._id }, { $set: { googleId: info.sub } });
+    }
     const upd = {
       googleId: info.sub,
       email: info.email,
@@ -203,13 +301,7 @@ app.get('/auth/google/callback', async (req, res) => {
     const user = r.value;
     console.log('[auth] login ok for user', String(user._id));
 
-    const rawToken = crypto.randomBytes(32).toString('hex');
-    await sessions.insertOne({
-      tokenHash: sha256hex(rawToken),
-      userId: user._id,
-      createdAt: now,
-      expiresAt: new Date(now.getTime() + SESSION_DAYS * 24 * 3600 * 1000),
-    });
+    const rawToken = await issueSession(user._id, now);
 
     res.redirect(302, `${PWA_URL}/#token=${rawToken}`);
   } catch (e) {
@@ -246,6 +338,149 @@ app.post('/api/logout', auth, async (req, res) => {
   const h = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
   await sessions.deleteOne({ tokenHash: sha256hex(h) });
   res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------- email-code login
+// The Android wrapper sends external hosts to Chrome, so Google OAuth can
+// never complete inside the app. Instead: the user types their email in the
+// app, we email a 6-digit code, and the app exchanges it for the SAME kind
+// of 365-day session Google login creates. Codes are stored hashed, expire
+// in 10 minutes, allow max 5 attempts, and are rate-limited per email + IP.
+async function issueSession(userId, now) {
+  const rawToken = crypto.randomBytes(32).toString('hex');
+  await sessions.insertOne({
+    tokenHash: sha256hex(rawToken),
+    userId,
+    createdAt: now,
+    expiresAt: new Date(now.getTime() + SESSION_DAYS * 24 * 3600 * 1000),
+  });
+  return rawToken;
+}
+
+async function findOrCreateUserByEmail(email) {
+  const now = new Date();
+  const existing = await users.findOne({ email });
+  if (existing) {
+    await users.updateOne({ _id: existing._id }, { $set: { lastLoginAt: now } });
+    return existing;
+  }
+  const doc = {
+    googleId: 'email:' + email,
+    email,
+    name: email.split('@')[0],
+    picture: '',
+    plan: 'free',
+    planExpiresAt: null,
+    createdAt: now,
+    lastLoginAt: now,
+  };
+  try {
+    const r = await users.insertOne(doc);
+    doc._id = r.insertedId;
+    return doc;
+  } catch (e) {
+    // unique-googleId race: someone created it first — just read it back
+    const again = await users.findOne({ email });
+    if (again) return again;
+    throw e;
+  }
+}
+
+const CODE_TTL_MS = 10 * 60 * 1000;
+const CODE_RESEND_MS = 60 * 1000;
+const CODE_MAX_PER_HOUR = 5;
+const CODE_MAX_ATTEMPTS = 5;
+const ipHits = new Map(); // ip -> [timestamps in the last hour]
+function ipFlooded(ip) {
+  const now = Date.now();
+  const arr = (ipHits.get(ip) || []).filter((t) => now - t < 3600000);
+  arr.push(now);
+  ipHits.set(ip, arr);
+  if (ipHits.size > 5000) ipHits.clear(); // crude memory guard on a tiny server
+  return arr.length > 100;
+}
+
+app.post('/api/auth/code/request', async (req, res) => {
+  try {
+    const email = String((req.body || {}).email || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+    if (!notify.mailSenderConfigured()) {
+      return res.status(503).json({ error: 'Email login is not set up yet. Please try again later.' });
+    }
+    if (ipFlooded(req.ip)) {
+      return res.status(429).json({ error: 'Too many requests — please try again later.' });
+    }
+    const now = new Date();
+    const existing = await logincodes.findOne({ email });
+    let sends = [];
+    if (existing) {
+      if (now.getTime() - new Date(existing.lastSentAt).getTime() < CODE_RESEND_MS) {
+        return res.status(429).json({ error: 'A code was just sent — wait a minute, check your inbox, then try again.' });
+      }
+      sends = (existing.sends || []).filter((t) => now.getTime() - new Date(t).getTime() < 3600000);
+      if (sends.length >= CODE_MAX_PER_HOUR) {
+        return res.status(429).json({ error: 'Too many codes requested — please try again in an hour.' });
+      }
+    }
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    sends.push(now);
+    await logincodes.updateOne(
+      { email },
+      { $set: { email, codeHash: sha256hex(email + ':' + code), expiresAt: new Date(now.getTime() + CODE_TTL_MS), attempts: 0, lastSentAt: now, sends } },
+      { upsert: true }
+    );
+    try {
+      await notify.sendLoginCode(email, code);
+    } catch (e) {
+      // Never leave a live code behind that the user never received.
+      await logincodes.deleteOne({ email });
+      console.error('[auth] login code send failed:', e.message);
+      return res.status(502).json({ error: 'Could not send the email — please try again.' });
+    }
+    console.log('[auth] login code sent to', email);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[auth] code request failed:', e.message);
+    res.status(500).json({ error: 'Something went wrong — please try again.' });
+  }
+});
+
+app.post('/api/auth/code/verify', async (req, res) => {
+  try {
+    const email = String((req.body || {}).email || '').trim().toLowerCase();
+    const code = String((req.body || {}).code || '').trim();
+    if (!email || !/^\d{6}$/.test(code)) {
+      return res.status(400).json({ error: 'Enter the 6-digit code from your email.' });
+    }
+    if (ipFlooded(req.ip)) {
+      return res.status(429).json({ error: 'Too many requests — please try again later.' });
+    }
+    const invalid = { error: 'Invalid or expired code — request a new one.' };
+    const doc = await logincodes.findOne({ email });
+    if (!doc || !doc.expiresAt || new Date(doc.expiresAt).getTime() < Date.now()) {
+      return res.status(400).json(invalid);
+    }
+    if ((doc.attempts || 0) >= CODE_MAX_ATTEMPTS) {
+      await logincodes.deleteOne({ email });
+      return res.status(400).json(invalid);
+    }
+    const given = Buffer.from(sha256hex(email + ':' + code));
+    const stored = Buffer.from(String(doc.codeHash || ''));
+    if (given.length !== stored.length || !crypto.timingSafeEqual(given, stored)) {
+      await logincodes.updateOne({ email }, { $inc: { attempts: 1 } });
+      return res.status(400).json(invalid);
+    }
+    await logincodes.deleteOne({ email });
+    const user = await findOrCreateUserByEmail(email);
+    const rawToken = await issueSession(user._id, new Date());
+    console.log('[auth] code login ok for user', String(user._id));
+    res.json({ token: rawToken, email: user.email, name: user.name || '' });
+  } catch (e) {
+    console.error('[auth] code verify failed:', e.message);
+    res.status(500).json({ error: 'Login failed — please try again.' });
+  }
 });
 
 // ---------------------------------------------------------------- JazzCash payments
@@ -298,6 +533,11 @@ app.post('/api/pay/jazzcash/return', async (req, res) => {
       await payments.updateOne({ _id: pay._id }, { $set: { status: 'success', paidAt: new Date(), ppResponse: String(b.pp_ResponseCode) } });
       await users.updateOne({ _id: pay.userId }, { $set: { plan: 'premium', planExpiresAt: expiresAt } });
       console.log('[pay] SUCCESS', pay.txnRefNo, pay.plan);
+      const pu = await users.findOne({ _id: pay.userId }, { projection: { email: 1 } });
+      notify.notifyActivated({
+        userEmail: pu ? pu.email : '', plan: pay.plan, amountRs: pay.amountRs,
+        expiresAt, via: 'JazzCash gateway (automatic)',
+      }).catch(() => {});
       return okPage('Payment kamyab! 🎉', 'Premium active ho gaya hai.');
     }
     await payments.updateOne({ _id: pay._id }, { $set: { status: 'failed', ppResponse: String(b.pp_ResponseCode || ''), ppMessage: String(b.pp_ResponseMessage || '').slice(0, 200) } });
@@ -318,6 +558,140 @@ app.get('/api/pay/status', auth, async (req, res) => {
   res.json({ status: pay.status, plan: u ? (u.plan || 'free') : 'free', planExpiresAt: u ? (u.planExpiresAt || null) : null });
 });
 
+// ---------------------------------------------------------------- manual payments
+app.get('/api/pay/plans', (req, res) => res.json({ plans: publicPlans() }));
+
+// Numbers + plans the app shows on the Subscribe screen. Auth required so the
+// numbers are only shown to logged-in customers.
+app.get('/api/pay/manual/config', auth, (req, res) => {
+  res.json({
+    configured: MANUAL_CONFIGURED,
+    methods: manualMethods(),
+    // legacy fields, kept for older app versions
+    jazzcash: MANUAL_PAY.jazzcashNumber ? { number: MANUAL_PAY.jazzcashNumber, title: MANUAL_PAY.jazzcashTitle } : null,
+    easypaisa: MANUAL_PAY.easypaisaNumber ? { number: MANUAL_PAY.easypaisaNumber, title: MANUAL_PAY.easypaisaTitle } : null,
+    plans: publicPlans(),
+  });
+});
+
+// User submits a manual payment: they already sent the money to the owner's
+// number and now give us the transaction ID from their JazzCash/Easypaisa app.
+app.post('/api/pay/manual', auth, async (req, res) => {
+  try {
+    if (!MANUAL_CONFIGURED) return res.status(503).json({ error: 'manual payments not configured' });
+    const { plan, method, txnId, senderName, senderNumber } = req.body || {};
+    const p = jazzcash.PLANS[plan];
+    if (!p) return res.status(400).json({ error: 'unknown plan' });
+    const m = manualMethods().find((x) => x.key === method);
+    if (!m) return res.status(400).json({ error: 'unknown or unavailable method' });
+    const cleanTxn = String(txnId || '').trim().toUpperCase().replace(/\s+/g, '');
+    if (!/^[A-Z0-9-]{5,40}$/.test(cleanTxn)) return res.status(400).json({ error: 'invalid transaction id' });
+    const txnRefNo = `MAN-${cleanTxn}`;
+
+    const existing = await payments.findOne({ txnRefNo });
+    if (existing) return res.status(409).json({ error: 'this transaction id was already submitted' });
+
+    await payments.insertOne({
+      txnRefNo, userId: new ObjectId(req.userId), plan,
+      amountRs: p.amountRs, status: 'manual_pending', kind: 'manual', method, methodLabel: m.label,
+      senderName: String(senderName || '').slice(0, 80),
+      senderNumber: String(senderNumber || '').slice(0, 30),
+      createdAt: new Date(),
+    });
+    console.log('[pay-manual] request', txnRefNo, plan, method);
+
+    const u = await users.findOne({ _id: new ObjectId(req.userId) }, { projection: { email: 1, name: 1 } });
+    notify.notifyManualRequest({
+      userEmail: u ? u.email : '', userName: u ? u.name : '',
+      plan, amountRs: p.amountRs, method, txnRefNo,
+      senderName: String(senderName || ''), senderNumber: String(senderNumber || ''),
+      adminUrl: SERVER_URL ? `${SERVER_URL}/admin` : '',
+    }).catch(() => {});
+
+    res.json({ ok: true, status: 'manual_pending', txnRefNo });
+  } catch (e) {
+    console.error('[pay-manual] submit failed:', e.message);
+    res.status(500).json({ error: 'could not submit payment' });
+  }
+});
+
+// The user's own manual payment requests (for the status list in the app).
+app.get('/api/pay/manual/mine', auth, async (req, res) => {
+  const list = await payments
+    .find({ userId: new ObjectId(req.userId), kind: 'manual' })
+    .sort({ createdAt: -1 })
+    .limit(10)
+    .toArray();
+  res.json({
+    payments: list.map((d) => ({
+      txnRefNo: d.txnRefNo, plan: d.plan, amountRs: d.amountRs,
+      status: d.status, method: d.method, createdAt: d.createdAt, paidAt: d.paidAt || null,
+    })),
+  });
+});
+
+// ---------------------------------------------------------------- owner admin
+app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin.html')));
+
+app.get('/api/admin/payments', adminOnly, async (req, res) => {
+  const status = String(req.query.status || 'manual_pending');
+  const list = await payments.find({ status }).sort({ createdAt: -1 }).limit(100).toArray();
+  const out = [];
+  for (const d of list) {
+    const u = await users.findOne({ _id: d.userId }, { projection: { email: 1, name: 1, plan: 1, planExpiresAt: 1 } });
+    out.push({
+      id: String(d._id), txnRefNo: d.txnRefNo, plan: d.plan, amountRs: d.amountRs,
+      status: d.status, kind: d.kind || 'gateway', method: d.methodLabel || d.method || '',
+      senderName: d.senderName || '', senderNumber: d.senderNumber || '',
+      createdAt: d.createdAt, paidAt: d.paidAt || null,
+      userEmail: u ? u.email : '', userName: u ? u.name : '',
+      userPlan: u ? (u.plan || 'free') : '', userPlanExpiresAt: u ? (u.planExpiresAt || null) : null,
+    });
+  }
+  res.json({ payments: out });
+});
+
+app.post('/api/admin/payments/:id/activate', adminOnly, async (req, res) => {
+  try {
+    const pay = await payments.findOne({ _id: new ObjectId(req.params.id) });
+    if (!pay) return res.status(404).json({ error: 'payment not found' });
+    if (pay.status === 'success') return res.status(409).json({ error: 'already activated' });
+    if (pay.status !== 'manual_pending') return res.status(409).json({ error: `cannot activate a payment with status ${pay.status}` });
+
+    const expiresAt = await activatePremium(pay.userId, pay.plan);
+    await payments.updateOne({ _id: pay._id }, { $set: { status: 'success', paidAt: new Date(), activatedBy: 'owner-admin' } });
+    console.log('[pay-manual] ACTIVATED', pay.txnRefNo, pay.plan, 'until', expiresAt.toISOString());
+
+    const u = await users.findOne({ _id: pay.userId }, { projection: { email: 1 } });
+    notify.notifyActivated({
+      userEmail: u ? u.email : '', plan: pay.plan, amountRs: pay.amountRs,
+      expiresAt, via: `manual ${pay.method || ''} (owner approved)`,
+    }).catch(() => {});
+
+    res.json({ ok: true, expiresAt });
+  } catch (e) {
+    console.error('[pay-manual] activate failed:', e.message);
+    res.status(500).json({ error: 'could not activate' });
+  }
+});
+
+app.post('/api/admin/payments/:id/reject', adminOnly, async (req, res) => {
+  try {
+    const pay = await payments.findOne({ _id: new ObjectId(req.params.id) });
+    if (!pay) return res.status(404).json({ error: 'payment not found' });
+    if (pay.status !== 'manual_pending') return res.status(409).json({ error: `cannot reject a payment with status ${pay.status}` });
+    await payments.updateOne(
+      { _id: pay._id },
+      { $set: { status: 'rejected', adminNote: String((req.body || {}).note || '').slice(0, 200) } }
+    );
+    console.log('[pay-manual] REJECTED', pay.txnRefNo);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[pay-manual] reject failed:', e.message);
+    res.status(500).json({ error: 'could not reject' });
+  }
+});
+
 // ---------------------------------------------------------------- start
 if (require.main === module) {
   initDb()
@@ -325,4 +699,4 @@ if (require.main === module) {
     .catch((e) => { console.error('[db] connect failed:', e.message); process.exit(1); });
 }
 
-module.exports = { app, buildGoogleAuthUrl, sha256hex };
+module.exports = { app, buildGoogleAuthUrl, sha256hex, publicPlans, manualMethods };

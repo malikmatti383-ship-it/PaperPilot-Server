@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PaperPilot — Owner Admin</title>
+<style>
+  body{font-family:system-ui,sans-serif;margin:0;background:#f4f6fb;color:#14213d}
+  header{background:#1a56db;color:#fff;padding:14px 16px;font-weight:800;font-size:18px}
+  main{max-width:560px;margin:0 auto;padding:14px}
+  .card{background:#fff;border-radius:12px;padding:14px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+  .muted{color:#5b6b83;font-size:13px}
+  .txn{font-size:19px;font-weight:800;letter-spacing:.4px;word-break:break-all}
+  .row{display:flex;gap:8px;margin-top:10px}
+  button{border:0;border-radius:9px;padding:11px 14px;font-size:15px;font-weight:700;cursor:pointer}
+  .go{background:#1a9e54;color:#fff;flex:1}
+  .no{background:#eef1f6;color:#b3261e}
+  .load{background:#1a56db;color:#fff;width:100%}
+  input{width:100%;box-sizing:border-box;padding:11px;border:1px solid #c9d4e5;border-radius:9px;font-size:15px;margin:8px 0}
+  select{width:100%;padding:11px;border:1px solid #c9d4e5;border-radius:9px;font-size:15px;margin:8px 0;background:#fff}
+  .pill{display:inline-block;border-radius:20px;padding:2px 9px;font-size:12px;font-weight:700;background:#fff3cd;color:#7a5b00}
+  .ok{color:#1a9e54;font-weight:700}.bad{color:#b3261e;font-weight:700}
+  a{color:#1a56db}
+</style>
+</head>
+<body>
+<header>PaperPilot — Owner Admin</header>
+<main>
+  <div class="card" id="key-box">
+    <b>Admin key</b>
+    <div class="muted">Enter the ADMIN_KEY you set on Render. It stays only in this browser tab.</div>
+    <input id="key" type="password" placeholder="Admin key" autocomplete="off">
+    <button class="load" onclick="load()">Load payment requests</button>
+    <div id="msg" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card">
+    <b>Show</b>
+    <select id="status" onchange="load()">
+      <option value="manual_pending">Pending verification</option>
+      <option value="success">Activated</option>
+      <option value="rejected">Rejected</option>
+    </select>
+  </div>
+
+  <div id="list"></div>
+  <p class="muted">Tip: before you Approve, check the Transaction ID and amount in your own payment app (JazzCash / Easypaisa / NayaPay / SadaPay / bank).</p>
+</main>
+<script>
+function key(){ try{ return sessionStorage.getItem('pp_admin_key')||''; }catch(e){ return ''; } }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function msg(t, ok){ document.getElementById('msg').innerHTML = '<span class="'+(ok?'ok':'bad')+'">'+esc(t)+'</span>'; }
+async function api(path, opts){
+  opts = opts || {};
+  opts.headers = Object.assign({'Content-Type':'application/json','x-admin-key':key()}, opts.headers||{});
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error || ('HTTP '+r.status));
+  return j;
+}
+async function load(){
+  const k = document.getElementById('key').value.trim();
+  if(k){ try{ sessionStorage.setItem('pp_admin_key', k); }catch(e){} }
+  if(!key()){ msg('Enter the admin key first.', false); return; }
+  msg('Loading…', true);
+  try{
+    const st = document.getElementById('status').value;
+    const j = await api('/api/admin/payments?status='+encodeURIComponent(st));
+    render(j.payments||[]);
+    msg((j.payments||[]).length + ' request(s)', true);
+  }catch(e){ msg(e.message, false); }
+}
+function render(list){
+  const el = document.getElementById('list');
+  if(!list.length){ el.innerHTML = '<div class="card muted">Nothing here.</div>'; return; }
+  el.innerHTML = list.map(p=>{
+    const d = p.createdAt ? new Date(p.createdAt).toLocaleString() : '';
+    const actions = p.status==='manual_pending'
+      ? '<div class="row"><button class="go" onclick="act(\''+p.id+'\',\'activate\')">✓ Approve — activate Premium</button>'+
+        '<button class="no" onclick="act(\''+p.id+'\',\'reject\')">Reject</button></div>'
+      : '';
+    return '<div class="card">'+
+      '<div><b>'+esc(p.userName||'')+'</b> <span class="muted">'+esc(p.userEmail||'')+'</span></div>'+
+      '<div style="margin:6px 0"><span class="pill">'+esc(p.plan)+'</span> <b>Rs '+esc(p.amountRs)+'</b> <span class="muted">via '+esc(p.method||p.kind||'')+'</span></div>'+
+      '<div class="txn">'+esc(String(p.txnRefNo||'').replace(/^MAN-/,'') )+'</div>'+
+      '<div class="muted">Transaction ID'+(p.senderName||p.senderNumber ? ' • From: '+esc(p.senderName||'')+' '+esc(p.senderNumber||'') : '')+'<br>'+esc(d)+
+      (p.status==='success' && p.paidAt ? '<br>Activated: '+esc(new Date(p.paidAt).toLocaleString()) : '')+'</div>'+
+      actions+'</div>';
+  }).join('');
+}
+async function act(id, what){
+  if(!confirm(what==='activate' ? 'Activate Premium for this customer?' : 'Reject this payment request?')) return;
+  try{
+    const j = await api('/api/admin/payments/'+id+'/'+what, {method:'POST', body:'{}'});
+    if(what==='activate') alert('Premium active until ' + (j.expiresAt ? new Date(j.expiresAt).toLocaleDateString() : ''));
+    load();
+  }catch(e){ alert(e.message); }
+}
+try{ const k = key(); if(k){ document.getElementById('key').value = k; load(); } }catch(e){}
+</script>
+</body>
+</html>
