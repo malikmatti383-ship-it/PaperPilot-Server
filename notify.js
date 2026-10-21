@@ -33,8 +33,18 @@ function getTransporter() {
   // Required lazily so the server still runs if the package is absent.
   const nodemailer = require('nodemailer');
   const c = mailConfig();
+  // Explicit host/port instead of service:'gmail': port 587 (STARTTLS) and
+  // forced IPv4 — the 'gmail' preset (port 465) timed out connecting from
+  // Render (observed 2026-10-21: send hung the full 2-minute default
+  // connectionTimeout). Short timeouts keep failures fast and visible.
   transporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false,
+    family: 4,
+    connectionTimeout: 30000,
+    greetingTimeout: 15000,
+    socketTimeout: 30000,
     auth: { user: c.user, pass: c.pass },
   });
   return transporter;
