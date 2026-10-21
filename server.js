@@ -26,10 +26,10 @@ const jazzcash = require('./jazzcash');
 
 // ---------------------------------------------------------------- env
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const MONGODB_URI = process.env.MONGODB_URI || '';
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
-const SERVER_URL = (process.env.SERVER_URL || '').replace(/\/$/, '');
+const MONGODB_URI = (process.env.MONGODB_URI || '').trim();
+const GOOGLE_CLIENT_ID = (process.env.GOOGLE_CLIENT_ID || '').trim();
+const GOOGLE_CLIENT_SECRET = (process.env.GOOGLE_CLIENT_SECRET || '').trim();
+const SERVER_URL = (process.env.SERVER_URL || '').trim().replace(/\/$/, '');
 const PWA_URL = (process.env.PWA_URL || 'https://malikmatti383-ship-it.github.io/Paper-Stock/').replace(/\/$/, '');
 
 // JazzCash (optional — payments disabled until these are set)
