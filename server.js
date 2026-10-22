@@ -256,19 +256,19 @@ function publicPlans() {
 // ---------------------------------------------------------------- routes
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
-app.get('/', (req, res) => res.send('PaperFlow API — ok. See /healthz'));
+app.get('/', (req, res) => res.send('ReamBook API — ok. See /healthz'));
 
-// PaperFlow APK download (in-app update channel). The binary rides in the
+// ReamBook APK download (in-app update channel). The binary rides in the
 // repo as base64 text (app-apk.b64) because repo pushes are text-only.
 let _apkBuf = null;
-app.get('/app/PaperFlow.apk', (req, res) => {
+app.get(['/app/ReamBook.apk', '/app/PaperFlow.apk'], (req, res) => {
   try {
     if (!_apkBuf) {
       const b64 = require('fs').readFileSync(path.join(__dirname, 'app-apk.b64'), 'utf8').replace(/\s+/g, '');
       _apkBuf = Buffer.from(b64, 'base64');
     }
     res.set('Content-Type', 'application/vnd.android.package-archive');
-    res.set('Content-Disposition', 'attachment; filename="PaperFlow.apk"');
+    res.set('Content-Disposition', 'attachment; filename="ReamBook.apk"');
     return res.send(_apkBuf);
   } catch (e) { return res.status(404).send('not available'); }
 });
