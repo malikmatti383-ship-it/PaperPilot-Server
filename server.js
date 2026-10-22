@@ -16,6 +16,11 @@
  *   GET  /api/admin/payments    (admin key) -> payment requests list
  *   POST /api/admin/payments/:id/activate (admin key) -> activate premium
  *   POST /api/admin/payments/:id/reject   (admin key) -> reject request
+ *   GET  /api/safepay/config    (auth) -> { configured, plans } for the Pay button
+ *   POST /api/safepay/checkout  (auth) -> create Safepay session, returns Checkout URL
+ *   GET  /api/safepay/status    (auth) -> poll payment; settles via Safepay reporter
+ *   POST /api/safepay/webhook   -> Safepay events (HMAC-SHA512 verified, ack-first)
+ *   GET  /pay/safepay/done|cancel -> hosted-checkout return pages
  *   GET  /admin                 -> owner admin page (admin.html)
  *   GET  /privacy               -> privacy policy page
  *   GET  /terms                 -> terms of service page
@@ -35,6 +40,7 @@ const { MongoClient, ObjectId } = require('mongodb');
 const path = require('path');
 const jazzcash = require('./jazzcash');
 const notify = require('./notify');
+const safepay = require('./safepay');
 
 // ---------------------------------------------------------------- env
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -706,6 +712,21 @@ app.post('/api/admin/payments/:id/reject', adminOnly, async (req, res) => {
     res.status(500).json({ error: 'could not reject' });
   }
 });
+
+// ---------------------------------------------------------------- Safepay payments
+// Automatic card/wallet checkout (see safepay.js). Dormant until the owner
+// sets SAFEPAY_* on Render: config reports configured:false, checkout 503s.
+safepay.registerSafepay(app, {
+  auth,
+  getPayments: () => payments,
+  getUsers: () => users,
+  activatePremium,
+  notifyActivated: (o) => notify.notifyActivated(o).catch(() => {}),
+  plans: jazzcash.PLANS,
+  publicPlans,
+  serverUrl: SERVER_URL,
+});
+if (!safepay.getConfig().configured) console.warn('[config] Safepay not configured — set SAFEPAY_SECRET_KEY / SAFEPAY_API_KEY (SAFEPAY_MODE=sandbox|live).');
 
 // ---------------------------------------------------------------- start
 if (require.main === module) {
