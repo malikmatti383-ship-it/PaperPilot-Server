@@ -24,9 +24,9 @@ const PROD_POST_URL = 'https://payments.jazzcash.com.pk/CustomerPortal/transacti
 // 6 months: 300*6 = 1800, 13% discount -> Rs 1566.
 // 1 year:   300*12 = 3600, 26% discount -> Rs 2664.
 const PLANS = {
-  monthly:    { amountRs: 300,  days: 30,  label: 'PaperPilotPremium-1Month' },
-  halfyearly: { amountRs: 1566, days: 180, label: 'PaperPilotPremium-6Months' },
-  yearly:     { amountRs: 2664, days: 365, label: 'PaperPilotPremium-1Year' },
+  monthly:    { amountRs: 300,  days: 30,  label: 'PaperFlowPremium-1Month' },
+  halfyearly: { amountRs: 1566, days: 180, label: 'PaperFlowPremium-6Months' },
+  yearly:     { amountRs: 2664, days: 365, label: 'PaperFlowPremium-1Year' },
 };
 
 /** YYYYMMDDHHMMSS in Asia/Karachi (UTC+5, no DST). */

@@ -256,7 +256,7 @@ function publicPlans() {
 // ---------------------------------------------------------------- routes
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
-app.get('/', (req, res) => res.send('PaperPilot API — ok. See /healthz'));
+app.get('/', (req, res) => res.send('PaperFlow API — ok. See /healthz'));
 
 app.get('/privacy', (req, res) => res.sendFile(path.join(__dirname, 'privacy.html')));
 app.get('/terms', (req, res) => res.sendFile(path.join(__dirname, 'terms.html')));

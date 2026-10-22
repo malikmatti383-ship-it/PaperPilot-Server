@@ -53,7 +53,7 @@ async function sendViaBrevo({ to, subject, text }) {
       accept: 'application/json',
     },
     body: JSON.stringify({
-      sender: { name: 'PaperPilot', email: senderEmail() },
+      sender: { name: 'PaperFlow', email: senderEmail() },
       to: [{ email: to }],
       subject,
       textContent: text,
@@ -72,7 +72,7 @@ async function deliver({ to, subject, text }) {
     return;
   }
   const c = mailConfig();
-  await getTransporter().sendMail({ from: `PaperPilot <${c.user}>`, to, subject, text });
+  await getTransporter().sendMail({ from: `PaperFlow <${c.user}>`, to, subject, text });
 }
 
 function getTransporter() {
@@ -116,11 +116,11 @@ async function sendLoginCode(toEmail, code) {
   }
   await deliver({
     to: toEmail,
-    subject: `PaperPilot login code: ${code}`,
+    subject: `PaperFlow login code: ${code}`,
     text: [
-      `Your PaperPilot login code is: ${code}`,
+      `Your PaperFlow login code is: ${code}`,
       '',
-      'Enter this code in the PaperPilot app to log in.',
+      'Enter this code in the PaperFlow app to log in.',
       'The code expires in 10 minutes.',
       '',
       'If you did not request this code, you can safely ignore this email.',
@@ -171,20 +171,20 @@ function notifyManualRequest({ userEmail, userName, plan, amountRs, method, txnR
     'If the money has arrived, open the admin page and tap Approve:',
     adminUrl || '(set SERVER_URL to get the admin link here)',
   );
-  return notifyOwner(`PaperPilot: New payment — ${userEmail} — ${plan} (Rs ${amountRs})`, lines.join('\n'));
+  return notifyOwner(`PaperFlow: New payment — ${userEmail} — ${plan} (Rs ${amountRs})`, lines.join('\n'));
 }
 
 /** A subscription became active (manual approval OR JazzCash auto payment). */
 function notifyActivated({ userEmail, plan, amountRs, expiresAt, via }) {
   const lines = [
-    'A PaperPilot subscription is now ACTIVE.',
+    'A PaperFlow subscription is now ACTIVE.',
     '',
     `Customer Gmail : ${userEmail || ''}`,
     `Plan           : ${plan}${amountRs ? ` — Rs ${amountRs}` : ''}`,
     `Active until   : ${fmtDate(expiresAt)}`,
     `Activated via  : ${via}`,
   ];
-  return notifyOwner(`PaperPilot: Subscription active — ${userEmail} — ${plan}`, lines.join('\n'));
+  return notifyOwner(`PaperFlow: Subscription active — ${userEmail} — ${plan}`, lines.join('\n'));
 }
 
 module.exports = { notifyOwner, notifyManualRequest, notifyActivated, mailConfigured, mailSenderConfigured, sendLoginCode };
