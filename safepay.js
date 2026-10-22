@@ -117,7 +117,13 @@ function createClient(cfg, fetchImpl) {
     });
     let j = null;
     try { j = await r.json(); } catch (e) { /* non-JSON response */ }
-    if (!r.ok) throw new Error(`safepay ${method} ${pathStr} -> HTTP ${r.status}`);
+    if (!r.ok) {
+      let msg = '';
+      try {
+        msg = (j && j.status && (j.status.message || (Array.isArray(j.status.errors) ? j.status.errors.join('; ') : ''))) || (j && j.message) || '';
+      } catch (e) { /* keep msg empty */ }
+      throw new Error(`safepay ${method} ${pathStr} -> HTTP ${r.status}${msg ? ': ' + msg : ''}`);
+    }
     return j;
   }
   return {
@@ -238,7 +244,7 @@ function registerSafepay(app, deps) {
       res.json({ checkoutUrl, tracker, amountRs: p.amountRs });
     } catch (e) {
       console.error('[safepay] checkout failed:', e.message);
-      res.status(500).json({ error: 'could not start payment' });
+      res.status(500).json({ error: 'could not start payment', detail: String((e && e.message) || '').slice(0, 300) });
     }
   });
 
