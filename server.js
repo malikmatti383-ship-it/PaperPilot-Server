@@ -166,6 +166,10 @@ app.set('trust proxy', 1);
 const allowedOrigins = (() => {
   const set = new Set(['http://localhost:3000', 'http://localhost:8080', 'http://127.0.0.1:5500']);
   try { set.add(new URL(PWA_URL).origin); } catch (e) { /* ignore */ }
+  // The owner admin page (/admin) is served from this server's own origin —
+  // without this entry the browser's CORS check rejects its POST calls
+  // (Approve/Reject) with HTTP 500 "CORS: origin not allowed" (hit 2026-10-23).
+  try { if (SERVER_URL) set.add(new URL(SERVER_URL).origin); } catch (e) { /* ignore */ }
   return set;
 })();
 
