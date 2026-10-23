@@ -681,7 +681,7 @@ app.post('/api/admin/payments/:id/activate', adminOnly, async (req, res) => {
     const pay = await payments.findOne({ _id: new ObjectId(req.params.id) });
     if (!pay) return res.status(404).json({ error: 'payment not found' });
     if (pay.status === 'success') return res.status(409).json({ error: 'already activated' });
-    if (pay.status !== 'manual_pending') return res.status(409).json({ error: `cannot activate a payment with status ${pay.status}` });
+    if (pay.status !== 'manual_pending' && pay.status !== 'rejected') return res.status(409).json({ error: `cannot activate a payment with status ${pay.status}` });
 
     const expiresAt = await activatePremium(pay.userId, pay.plan);
     await payments.updateOne({ _id: pay._id }, { $set: { status: 'success', paidAt: new Date(), activatedBy: 'owner-admin' } });

@@ -78,6 +78,8 @@ function render(list){
     const actions = p.status==='manual_pending'
       ? '<div class="row"><button class="go" onclick="act(\''+p.id+'\',\'activate\')">✓ Approve — activate Premium</button>'+
         '<button class="no" onclick="act(\''+p.id+'\',\'reject\')">Reject</button></div>'
+      : p.status==='rejected'
+      ? '<div class="row"><button class="go" onclick="act(\''+p.id+'\',\'activate\')">✓ Approve anyway — activate Premium</button></div>'
       : '';
     return '<div class="card">'+
       '<div><b>'+esc(p.userName||'')+'</b> <span class="muted">'+esc(p.userEmail||'')+'</span></div>'+
