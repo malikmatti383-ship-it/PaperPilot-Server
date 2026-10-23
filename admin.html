@@ -81,7 +81,7 @@ function render(list){
       : '';
     return '<div class="card">'+
       '<div><b>'+esc(p.userName||'')+'</b> <span class="muted">'+esc(p.userEmail||'')+'</span></div>'+
-      '<div style="margin:6px 0"><span class="pill">'+esc(p.plan)+'</span> <b>Rs '+esc(p.amountRs)+'</b> <span class="muted">via '+esc(p.method||p.kind||'')+'</span></div>'+
+      '<div style="margin:6px 0"><span class="pill">'+esc(({monthly:'Basic',halfyearly:'Pro',yearly:'Premium'})[p.plan]||p.plan)+'</span> <b>Rs '+esc(p.amountRs)+'</b> <span class="muted">via '+esc(p.method||p.kind||'')+'</span></div>'+
       '<div class="txn">'+esc(String(p.txnRefNo||'').replace(/^MAN-/,'') )+'</div>'+
       '<div class="muted">Transaction ID'+(p.senderName||p.senderNumber ? ' • From: '+esc(p.senderName||'')+' '+esc(p.senderNumber||'') : '')+'<br>'+esc(d)+
       (p.status==='success' && p.paidAt ? '<br>Activated: '+esc(new Date(p.paidAt).toLocaleString()) : '')+'</div>'+
