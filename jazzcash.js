@@ -25,8 +25,8 @@ const PROD_POST_URL = 'https://payments.jazzcash.com.pk/CustomerPortal/transacti
 // 1 year:   300*12 = 3600, 26% discount -> Rs 2664.
 const PLANS = {
   monthly:    { amountRs: 300,  days: 30,  label: 'Basic' },
-  halfyearly: { amountRs: 1566, days: 180, label: 'Pro' },
-  yearly:     { amountRs: 2664, days: 365, label: 'Premium' },
+  halfyearly: { amountRs: 1600, days: 180, label: 'Pro' },
+  yearly:     { amountRs: 2700, days: 365, label: 'Premium' },
 };
 
 /** YYYYMMDDHHMMSS in Asia/Karachi (UTC+5, no DST). */
