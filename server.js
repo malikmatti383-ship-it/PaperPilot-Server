@@ -203,6 +203,7 @@ async function initDb() {
   await sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
   await syncdata.createIndex({ userId: 1 }, { unique: true });
   await payments.createIndex({ txnRefNo: 1 }, { unique: true });
+  await users.createIndex({ uid: 1 }, { unique: true, sparse: true }).catch(() => {});
   await payments.createIndex({ userId: 1 });
   console.log('[db] connected, indexes ready');
 }
@@ -336,10 +337,28 @@ app.get('/auth/google/callback', async (req, res) => {
 });
 
 app.get('/api/me', auth, async (req, res) => {
-  const u = await users.findOne({ _id: new ObjectId(req.userId) }, { projection: { email: 1, name: 1, picture: 1, plan: 1, planExpiresAt: 1 } });
+  const u = await users.findOne({ _id: new ObjectId(req.userId) }, { projection: { email: 1, name: 1, picture: 1, plan: 1, planExpiresAt: 1, uid: 1 } });
   if (!u) return res.status(404).json({ error: 'user not found' });
-  res.json({ email: u.email, name: u.name, picture: u.picture, plan: u.plan || 'free', planExpiresAt: u.planExpiresAt || null });
+  const uid = await ensureUid(u);
+  res.json({ email: u.email, name: u.name, picture: u.picture, plan: u.plan || 'free', planExpiresAt: u.planExpiresAt || null, uid: uid || '' });
 });
+
+// every user gets a short public ID (shown as RB-123456) — copyable in the app,
+// attached to payment claims and searchable in the owner admin page.
+async function ensureUid(u) {
+  if (!u) return null;
+  if (u.uid) return u.uid;
+  for (let i = 0; i < 8; i++) {
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    try {
+      const r = await users.updateOne({ _id: u._id, uid: { $exists: false } }, { $set: { uid: code } });
+      if (r.modifiedCount) return code;
+      const fresh = await users.findOne({ _id: u._id }, { projection: { uid: 1 } });
+      if (fresh && fresh.uid) return fresh.uid;
+    } catch (e) { /* duplicate uid — retry with a new code */ }
+  }
+  return null;
+}
 
 app.get('/api/data', auth, async (req, res) => {
   const doc = await syncdata.findOne({ userId: new ObjectId(req.userId) });
@@ -604,7 +623,7 @@ app.get('/api/pay/manual/config', auth, (req, res) => {
 app.post('/api/pay/manual', auth, async (req, res) => {
   try {
     if (!MANUAL_CONFIGURED) return res.status(503).json({ error: 'manual payments not configured' });
-    const { plan, method, txnId, senderName, senderNumber } = req.body || {};
+    const { plan, method, txnId, senderName, senderNumber, slip } = req.body || {};
     const p = jazzcash.PLANS[plan];
     if (!p) return res.status(400).json({ error: 'unknown plan' });
     const m = manualMethods().find((x) => x.key === method);
@@ -612,6 +631,14 @@ app.post('/api/pay/manual', auth, async (req, res) => {
     const cleanTxn = String(txnId || '').trim().toUpperCase().replace(/\s+/g, '');
     if (!/^[A-Z0-9-]{5,40}$/.test(cleanTxn)) return res.status(400).json({ error: 'invalid transaction id' });
     const txnRefNo = `MAN-${cleanTxn}`;
+
+    let slipData = null;
+    if (slip != null && slip !== '') {
+      if (typeof slip !== 'string' || !slip.startsWith('data:image/') || slip.length > 2500000) {
+        return res.status(400).json({ error: 'slip photo is too large or invalid' });
+      }
+      slipData = slip;
+    }
 
     const existing = await payments.findOne({ txnRefNo });
     if (existing) return res.status(409).json({ error: 'this transaction id was already submitted' });
@@ -621,6 +648,7 @@ app.post('/api/pay/manual', auth, async (req, res) => {
       amountRs: p.amountRs, status: 'manual_pending', kind: 'manual', method, methodLabel: m.label,
       senderName: String(senderName || '').slice(0, 80),
       senderNumber: String(senderNumber || '').slice(0, 30),
+      slip: slipData,
       createdAt: new Date(),
     });
     console.log('[pay-manual] request', txnRefNo, plan, method);
@@ -658,22 +686,45 @@ app.get('/api/pay/manual/mine', auth, async (req, res) => {
 // ---------------------------------------------------------------- owner admin
 app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin.html')));
 
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 app.get('/api/admin/payments', adminOnly, async (req, res) => {
-  const status = String(req.query.status || 'manual_pending');
-  const list = await payments.find({ status }).sort({ createdAt: -1 }).limit(100).toArray();
+  const q = String(req.query.q || '').trim();
+  let filter;
+  if (q) {
+    const or = [{ txnRefNo: new RegExp(escapeRegExp(q.replace(/^MAN-/i, '')), 'i') }];
+    const digits = q.replace(/^RB-/i, '').replace(/\D/g, '');
+    const uq = [{ email: new RegExp(escapeRegExp(q), 'i') }, { name: new RegExp(escapeRegExp(q), 'i') }];
+    if (digits) uq.push({ uid: digits });
+    const us = await users.find({ $or: uq }, { projection: { _id: 1 } }).limit(50).toArray();
+    if (us.length) or.push({ userId: { $in: us.map((x) => x._id) } });
+    filter = { $or: or };
+  } else {
+    filter = { status: String(req.query.status || 'manual_pending') };
+  }
+  const list = await payments.find(filter).sort({ createdAt: -1 }).limit(100).toArray();
   const out = [];
   for (const d of list) {
-    const u = await users.findOne({ _id: d.userId }, { projection: { email: 1, name: 1, plan: 1, planExpiresAt: 1 } });
+    const u = await users.findOne({ _id: d.userId }, { projection: { email: 1, name: 1, plan: 1, planExpiresAt: 1, uid: 1 } });
     out.push({
       id: String(d._id), txnRefNo: d.txnRefNo, plan: d.plan, amountRs: d.amountRs,
       status: d.status, kind: d.kind || 'gateway', method: d.methodLabel || d.method || '',
       senderName: d.senderName || '', senderNumber: d.senderNumber || '',
+      hasSlip: !!d.slip,
       createdAt: d.createdAt, paidAt: d.paidAt || null,
-      userEmail: u ? u.email : '', userName: u ? u.name : '',
+      userEmail: u ? u.email : '', userName: u ? u.name : '', userUid: u ? (u.uid || '') : '',
       userPlan: u ? (u.plan || 'free') : '', userPlanExpiresAt: u ? (u.planExpiresAt || null) : null,
     });
   }
   res.json({ payments: out });
+});
+
+app.get('/api/admin/payments/:id/slip', adminOnly, async (req, res) => {
+  try {
+    const d = await payments.findOne({ _id: new ObjectId(req.params.id) }, { projection: { slip: 1 } });
+    if (!d || !d.slip) return res.status(404).json({ error: 'no slip photo for this payment' });
+    res.json({ slip: d.slip });
+  } catch (e) { res.status(400).json({ error: 'bad id' }); }
 });
 
 app.post('/api/admin/payments/:id/activate', adminOnly, async (req, res) => {

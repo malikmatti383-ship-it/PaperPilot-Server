@@ -16,9 +16,12 @@
   .go{background:#1a9e54;color:#fff;flex:1}
   .no{background:#eef1f6;color:#b3261e}
   .load{background:#1a56db;color:#fff;width:100%}
+  .slipbtn{background:#eef3ff;color:#1a56db;width:100%;margin-top:10px}
   input{width:100%;box-sizing:border-box;padding:11px;border:1px solid #c9d4e5;border-radius:9px;font-size:15px;margin:8px 0}
   select{width:100%;padding:11px;border:1px solid #c9d4e5;border-radius:9px;font-size:15px;margin:8px 0;background:#fff}
   .pill{display:inline-block;border-radius:20px;padding:2px 9px;font-size:12px;font-weight:700;background:#fff3cd;color:#7a5b00}
+  .uid{display:inline-block;border-radius:8px;padding:2px 9px;font-size:13px;font-weight:800;background:#e8f1fd;color:#1a56db}
+  .st-pend{color:#b26a00;font-weight:800}.st-ok{color:#1a7f37;font-weight:800}.st-rej{color:#b3261e;font-weight:800}
   .ok{color:#1a9e54;font-weight:700}.bad{color:#b3261e;font-weight:700}
   a{color:#1a56db}
 </style>
@@ -36,17 +39,25 @@
 
   <div class="card">
     <b>Show</b>
-    <select id="status" onchange="load()">
+    <select id="status" onchange="clearSearch(true)">
       <option value="manual_pending">Pending verification</option>
       <option value="success">Activated</option>
       <option value="rejected">Rejected</option>
     </select>
+    <b>Search any customer</b>
+    <div class="muted">Find a payment by the customer's ID, email or Transaction ID — works even after Approve or Reject (so a mistake can be found and fixed).</div>
+    <input id="q" placeholder="RB-123456, email, or Transaction ID" autocomplete="off" onkeydown="if(event.key==='Enter')doSearch()">
+    <div class="row" style="margin-top:2px">
+      <button class="go" style="background:#1a56db" onclick="doSearch()">🔍 Search</button>
+      <button class="no" style="color:#14213d" onclick="clearSearch(false)">Show list</button>
+    </div>
   </div>
 
   <div id="list"></div>
-  <p class="muted">Tip: before you Approve, check the Transaction ID and amount in your own payment app (JazzCash / Easypaisa / NayaPay / SadaPay / bank).</p>
+  <p class="muted">Tip: before you Approve, open the slip photo and check the Transaction ID and amount in your own payment app (Easypaisa / NayaPay / bank).</p>
 </main>
 <script>
+let Q='';
 function key(){ try{ return sessionStorage.getItem('pp_admin_key')||''; }catch(e){ return ''; } }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function msg(t, ok){ document.getElementById('msg').innerHTML = '<span class="'+(ok?'ok':'bad')+'">'+esc(t)+'</span>'; }
@@ -58,16 +69,19 @@ async function api(path, opts){
   if(!r.ok) throw new Error(j.error || ('HTTP '+r.status));
   return j;
 }
+function doSearch(){ Q = document.getElementById('q').value.trim(); load(); }
+function clearSearch(silent){ Q=''; document.getElementById('q').value=''; if(!silent) load(); else load(); }
 async function load(){
   const k = document.getElementById('key').value.trim();
   if(k){ try{ sessionStorage.setItem('pp_admin_key', k); }catch(e){} }
   if(!key()){ msg('Enter the admin key first.', false); return; }
   msg('Loading…', true);
   try{
-    const st = document.getElementById('status').value;
-    const j = await api('/api/admin/payments?status='+encodeURIComponent(st));
+    const url = Q ? '/api/admin/payments?q='+encodeURIComponent(Q)
+                  : '/api/admin/payments?status='+encodeURIComponent(document.getElementById('status').value);
+    const j = await api(url);
     render(j.payments||[]);
-    msg((j.payments||[]).length + ' request(s)', true);
+    msg((Q?('Search "'+Q+'" — '):'') + (j.payments||[]).length + ' request(s)', true);
   }catch(e){ msg(e.message, false); }
 }
 function render(list){
@@ -75,20 +89,35 @@ function render(list){
   if(!list.length){ el.innerHTML = '<div class="card muted">Nothing here.</div>'; return; }
   el.innerHTML = list.map(p=>{
     const d = p.createdAt ? new Date(p.createdAt).toLocaleString() : '';
+    const st = p.status==='manual_pending' ? '<span class="st-pend">● Pending</span>'
+             : p.status==='success' ? '<span class="st-ok">● Approved</span>'
+             : '<span class="st-rej">● Rejected</span>';
     const actions = p.status==='manual_pending'
-      ? '<div class="row"><button class="go" onclick="act(\''+p.id+'\',\'activate\')">✓ Approve — activate Premium</button>'+
+      ? '<div class="row"><button class="go" onclick="act(\''+p.id+'\',\'activate\')">✓ Approve — activate</button>'+
         '<button class="no" onclick="act(\''+p.id+'\',\'reject\')">Reject</button></div>'
       : p.status==='rejected'
-      ? '<div class="row"><button class="go" onclick="act(\''+p.id+'\',\'activate\')">✓ Approve anyway — activate Premium</button></div>'
+      ? '<div class="row"><button class="go" onclick="act(\''+p.id+'\',\'activate\')">✓ Approve anyway — activate</button></div>'
       : '';
+    const slip = p.hasSlip ? '<button class="slipbtn" onclick="viewSlip(\''+p.id+'\',this)">🖼 View slip photo</button><div class="slipbox"></div>' : '';
     return '<div class="card">'+
       '<div><b>'+esc(p.userName||'')+'</b> <span class="muted">'+esc(p.userEmail||'')+'</span></div>'+
+      '<div style="margin:6px 0"><span class="uid">'+(p.userUid?('ID: RB-'+esc(p.userUid)):'No ID yet')+'</span> '+st+'</div>'+
       '<div style="margin:6px 0"><span class="pill">'+esc(({monthly:'Basic',halfyearly:'Pro',yearly:'Premium'})[p.plan]||p.plan)+'</span> <b>Rs '+esc(p.amountRs)+'</b> <span class="muted">via '+esc(p.method||p.kind||'')+'</span></div>'+
       '<div class="txn">'+esc(String(p.txnRefNo||'').replace(/^MAN-/,'') )+'</div>'+
       '<div class="muted">Transaction ID'+(p.senderName||p.senderNumber ? ' • From: '+esc(p.senderName||'')+' '+esc(p.senderNumber||'') : '')+'<br>'+esc(d)+
       (p.status==='success' && p.paidAt ? '<br>Activated: '+esc(new Date(p.paidAt).toLocaleString()) : '')+'</div>'+
-      actions+'</div>';
+      slip+actions+'</div>';
   }).join('');
+}
+async function viewSlip(id, btn){
+  const wrap = btn.parentElement.querySelector('.slipbox');
+  if(wrap.innerHTML){ wrap.innerHTML=''; btn.textContent='🖼 View slip photo'; return; }
+  btn.textContent='Loading photo…';
+  try{
+    const j = await api('/api/admin/payments/'+id+'/slip');
+    wrap.innerHTML = '<img src="'+j.slip+'" style="width:100%;border-radius:10px;margin-top:8px;border:1px solid #e3e7ee" alt="payment slip">';
+    btn.textContent='🖼 Hide slip photo';
+  }catch(e){ btn.textContent='🖼 Photo could not load'; }
 }
 async function act(id, what){
   if(!confirm(what==='activate' ? 'Activate Premium for this customer?' : 'Reject this payment request?')) return;
