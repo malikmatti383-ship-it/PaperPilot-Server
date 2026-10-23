@@ -270,6 +270,20 @@ app.get('/healthz', (req, res) => res.json({ ok: true }));
 app.get('/', (req, res) => res.send('ReamBook API — ok. See /healthz'));
 
 // ReamBook APK download (in-app update channel). The binary rides in the
+// ReamBook logo for share previews (WhatsApp card image) — same base64
+// text trick as the APK, because repo pushes are text-only.
+let _logoBuf = null;
+app.get('/logo.png', (req, res) => {
+  try {
+    if (!_logoBuf) {
+      const b64 = require('fs').readFileSync(path.join(__dirname, 'logo.b64'), 'utf8').replace(/\s+/g, '');
+      _logoBuf = Buffer.from(b64, 'base64');
+    }
+    res.set('Content-Type', 'image/png');
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(_logoBuf);
+  } catch (e) { res.status(404).send('no logo'); }
+});
 // repo as base64 text (app-apk.b64) because repo pushes are text-only.
 let _apkBuf = null;
 app.get(['/app/ReamBook.apk', '/app/PaperFlow.apk'], (req, res) => {
