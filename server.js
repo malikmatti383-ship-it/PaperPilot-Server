@@ -303,7 +303,7 @@ app.get('/terms', (req, res) => res.sendFile(path.join(__dirname, 'terms.html'))
 
 app.get('/auth/google', (req, res) => {
   const redirectUri = `${SERVER_URL}/auth/google/callback`;
-  const state = crypto.randomBytes(8).toString('hex');
+  const state = crypto.randomBytes(8).toString('hex') + (req.query.app ? '.app' : '');
   res.redirect(302, buildGoogleAuthUrl({ clientId: GOOGLE_CLIENT_ID, redirectUri, state }));
 });
 
@@ -343,10 +343,14 @@ app.get('/auth/google/callback', async (req, res) => {
 
     const rawToken = await issueSession(user._id, now);
 
-    res.redirect(302, `${PWA_URL}/#token=${rawToken}`);
+    // App flow (Google tap-login): send the token back into the app through
+    // its reambook:// scheme; the wrapper hands it to the web layer.
+    const isApp = String(req.query.state || '').endsWith('.app');
+    res.redirect(302, isApp ? `reambook://auth#token=${rawToken}` : `${PWA_URL}/#token=${rawToken}`);
   } catch (e) {
     console.error('[auth] callback failed:', e.message);
-    res.redirect(302, `${PWA_URL}/#auth=error`);
+    const isApp = String(req.query.state || '').endsWith('.app');
+    res.redirect(302, isApp ? 'reambook://auth#auth=error' : `${PWA_URL}/#auth=error`);
   }
 });
 
