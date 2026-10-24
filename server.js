@@ -333,12 +333,12 @@ app.get('/auth/google/callback', async (req, res) => {
       picture: info.picture || '',
       lastLoginAt: now,
     };
-    const r = await users.findOneAndUpdate(
+    const user = await users.findOneAndUpdate(
       { googleId: info.sub },
       { $set: upd, $setOnInsert: { plan: 'free', planExpiresAt: null, createdAt: now } },
       { upsert: true, returnDocument: 'after' }
     );
-    const user = r.value;
+    if (!user) throw new Error('user upsert failed');
     console.log('[auth] login ok for user', String(user._id));
 
     const rawToken = await issueSession(user._id, now);
@@ -350,7 +350,8 @@ app.get('/auth/google/callback', async (req, res) => {
   } catch (e) {
     console.error('[auth] callback failed:', e.message);
     const isApp = String(req.query.state || '').endsWith('.app');
-    res.redirect(302, isApp ? 'reambook://auth#auth=error' : `${PWA_URL}/#auth=error`);
+    const why = /token exchange/.test(e.message) ? 'token' : (/userinfo|incomplete/.test(e.message) ? 'userinfo' : 'server');
+    res.redirect(302, isApp ? `reambook://auth#auth=error&why=${why}` : `${PWA_URL}/#auth=error`);
   }
 });
 
