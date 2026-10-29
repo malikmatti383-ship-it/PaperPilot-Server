@@ -184,7 +184,7 @@ app.use(express.urlencoded({ extended: false })); // JazzCash posts its result a
 
 // ---------------------------------------------------------------- db
 const mongo = new MongoClient(MONGODB_URI);
-let db, users, sessions, syncdata, payments, logincodes;
+let db, users, sessions, syncdata, payments, logincodes, adminkey, adminreset;
 
 async function initDb() {
   await mongo.connect();
@@ -196,6 +196,29 @@ async function initDb() {
   logincodes = db.collection('logincodes');
   await logincodes.createIndex({ email: 1 }, { unique: true });
   await logincodes.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  // Admin key lives in the DB so "forgot key" can rotate it at runtime
+  // (no Render env change / restart needed). One-time migration from env.
+  adminkey = db.collection('adminkey');
+  adminreset = db.collection('adminreset');
+  await adminreset.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+  if (ADMIN_KEY) {
+    const salt = crypto.randomBytes(16).toString('hex');
+    const r = await adminkey.updateOne(
+      { _id: 'key' },
+      {
+        $setOnInsert: {
+          keyHash: sha256hex(salt + ':' + ADMIN_KEY),
+          salt,
+          updatedAt: new Date(),
+          migratedFromEnv: true,
+        },
+      },
+      { upsert: true }
+    );
+    console.log('[admin] key store ready (' + (r.upsertedCount ? 'migrated from env' : 'already in DB') + ')');
+  } else {
+    console.warn('[admin] ADMIN_KEY not set and no DB key — /api/admin/* will return 503.');
+  }
   await users.createIndex({ googleId: 1 }, { unique: true });
   await sessions.createIndex({ tokenHash: 1 }, { unique: true });
   await sessions.createIndex({ userId: 1 });
@@ -228,15 +251,37 @@ async function auth(req, res, next) {
 }
 
 // ---------------------------------------------------------------- admin + premium helpers
-function adminOnly(req, res, next) {
-  if (!ADMIN_KEY) return res.status(503).json({ error: 'admin not configured' });
-  const key = String(req.headers['x-admin-key'] || '');
-  const a = Buffer.from(key);
-  const b = Buffer.from(ADMIN_KEY);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-    return res.status(401).json({ error: 'invalid admin key' });
+function hashAdminKey(key, salt) { return sha256hex(salt + ':' + key); }
+
+/** The live admin key record: DB wins (rotated via "forgot key"); env is the fallback. */
+async function getAdminKeyRecord() {
+  try {
+    const d = await adminkey.findOne({ _id: 'key' });
+    if (d && d.keyHash && d.salt) return d;
+  } catch (e) { console.error('[admin] key lookup failed:', e.message); }
+  return null;
+}
+
+async function adminOnly(req, res, next) {
+  try {
+    const key = String(req.headers['x-admin-key'] || '');
+    const rec = await getAdminKeyRecord();
+    let ok = false;
+    if (rec) {
+      const given = Buffer.from(hashAdminKey(key, rec.salt));
+      const stored = Buffer.from(String(rec.keyHash));
+      ok = given.length === stored.length && crypto.timingSafeEqual(given, stored);
+    } else if (ADMIN_KEY) {
+      const a = Buffer.from(key);
+      const b = Buffer.from(ADMIN_KEY);
+      ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+    }
+    if (!ok) return res.status(401).json({ error: 'invalid admin key' });
+    next();
+  } catch (e) {
+    console.error('[admin] auth error', e.message);
+    res.status(500).json({ error: 'auth error' });
   }
-  next();
 }
 
 /**
@@ -704,6 +749,95 @@ app.get('/api/pay/manual/mine', auth, async (req, res) => {
 
 // ---------------------------------------------------------------- owner admin
 app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin.html')));
+
+// ------------------------------------------------- admin "forgot key" flow
+// Step 1: owner taps "Forgot the key?" -> 6-digit code emailed to OWNER_NOTIFY_EMAIL.
+// Step 2: owner submits code + new key -> keyHash rotated in DB (takes effect
+// immediately, no Render restart). Mirrors the login-code security pattern:
+// hashed codes, 10-min TTL, attempt cap, per-IP flood guard.
+const ADMIN_RESET_TTL_MS = 10 * 60 * 1000;
+const ADMIN_RESET_MAX_ATTEMPTS = 5;
+const ADMIN_RESET_RESEND_MS = 20 * 60 * 1000; // one live code per 20 min
+
+function ownerEmail() { return String(process.env.OWNER_NOTIFY_EMAIL || '').trim(); }
+
+app.post('/api/admin/forgot', async (req, res) => {
+  try {
+    if (ipFlooded(req.ip)) return res.status(429).json({ error: 'Too many requests — please try again later.' });
+    const to = ownerEmail();
+    if (!to) return res.status(503).json({ error: 'Owner email is not configured on the server.' });
+    if (!notify.mailSenderConfigured()) {
+      return res.status(503).json({ error: 'Email is not configured on the server.' });
+    }
+    const now = Date.now();
+    const existing = await adminreset.findOne({ _id: 'reset' });
+    if (existing && existing.requestedAt && new Date(existing.requestedAt).getTime() > now - ADMIN_RESET_RESEND_MS) {
+      return res.json({ ok: true, note: 'code already sent' }); // don't reveal timing
+    }
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const doc = {
+      _id: 'reset',
+      codeHash: sha256hex('adminreset:' + code),
+      expiresAt: new Date(now + ADMIN_RESET_TTL_MS),
+      attempts: 0,
+      requestedAt: new Date(now),
+    };
+    await adminreset.updateOne({ _id: 'reset' }, { $set: doc }, { upsert: true });
+    try {
+      await notify.sendAdminResetCode(to, code);
+    } catch (e) {
+      // Never leave a live code behind that the owner never received.
+      await adminreset.deleteOne({ _id: 'reset' });
+      console.error('[admin] reset code send failed:', e.message);
+      return res.status(502).json({ error: 'Could not send the email — please try again.' });
+    }
+    console.log('[admin] reset code sent');
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[admin] forgot failed:', e.message);
+    res.status(500).json({ error: 'Something went wrong — please try again.' });
+  }
+});
+
+app.post('/api/admin/reset', async (req, res) => {
+  try {
+    if (ipFlooded(req.ip)) return res.status(429).json({ error: 'Too many requests — please try again later.' });
+    const code = String(((req.body || {}).code) || '').trim();
+    const newKey = String(((req.body || {}).newKey) || '');
+    if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Enter the 6-digit code from your email.' });
+    if (newKey.length < 12 || newKey.length > 128) {
+      return res.status(400).json({ error: 'New key must be 12 to 128 characters long.' });
+    }
+    const invalid = { error: 'Invalid or expired code — request a new one.' };
+    const doc = await adminreset.findOne({ _id: 'reset' });
+    if (!doc || !doc.expiresAt || new Date(doc.expiresAt).getTime() < Date.now()) {
+      return res.status(400).json(invalid);
+    }
+    if ((doc.attempts || 0) >= ADMIN_RESET_MAX_ATTEMPTS) {
+      await adminreset.deleteOne({ _id: 'reset' });
+      return res.status(400).json(invalid);
+    }
+    const given = Buffer.from(sha256hex('adminreset:' + code));
+    const stored = Buffer.from(String(doc.codeHash || ''));
+    if (given.length !== stored.length || !crypto.timingSafeEqual(given, stored)) {
+      await adminreset.updateOne({ _id: 'reset' }, { $inc: { attempts: 1 } });
+      return res.status(400).json(invalid);
+    }
+    // Code is valid — rotate the key. Old key stops working immediately.
+    const salt = crypto.randomBytes(16).toString('hex');
+    await adminkey.updateOne(
+      { _id: 'key' },
+      { $set: { keyHash: hashAdminKey(newKey, salt), salt, updatedAt: new Date(), rotatedVia: 'forgot-flow' } },
+      { upsert: true }
+    );
+    await adminreset.deleteOne({ _id: 'reset' });
+    console.log('[admin] key rotated via forgot-flow');
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[admin] reset failed:', e.message);
+    res.status(500).json({ error: 'Something went wrong — please try again.' });
+  }
+});
 
 const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 

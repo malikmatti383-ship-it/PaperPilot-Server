@@ -187,4 +187,26 @@ function notifyActivated({ userEmail, plan, amountRs, expiresAt, via }) {
   return notifyOwner(`ReamBook: Subscription active — ${userEmail} — ${plan}`, lines.join('\n'));
 }
 
-module.exports = { notifyOwner, notifyManualRequest, notifyActivated, mailConfigured, mailSenderConfigured, sendLoginCode };
+/** Sends a 6-digit admin-key reset code to the owner. THROWS on failure. */
+async function sendAdminResetCode(toEmail, code) {
+  if (!mailSenderConfigured()) {
+    const e = new Error('mail not configured');
+    e.code = 'MAIL_NOT_CONFIGURED';
+    throw e;
+  }
+  await deliver({
+    to: toEmail,
+    subject: `ReamBook admin key reset code: ${code}`,
+    text: [
+      `Your ReamBook admin key reset code is: ${code}`,
+      '',
+      'Enter this code on the admin page (/admin) together with your new admin key.',
+      'The code expires in 10 minutes and can be used only once.',
+      '',
+      'If you did not request this code, someone may be trying to reset your admin key — you can safely ignore this email (nothing changes without the code).',
+    ].join('\n'),
+  });
+  return true;
+}
+
+module.exports = { notifyOwner, notifyManualRequest, notifyActivated, mailConfigured, mailSenderConfigured, sendLoginCode, sendAdminResetCode };

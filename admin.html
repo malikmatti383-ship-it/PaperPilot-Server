@@ -35,6 +35,17 @@
     <input id="key" type="password" placeholder="Admin key" autocomplete="off">
     <button class="load" onclick="load()">Load payment requests</button>
     <div id="msg" style="margin-top:8px"></div>
+    <div style="margin-top:10px"><a href="#" onclick="showForgot(event)">Forgot the key?</a></div>
+  </div>
+
+  <div class="card hidden" id="forgot-box" style="display:none">
+    <b>Reset admin key</b>
+    <div class="muted">Step 1: we email a 6-digit code to your Gmail. Step 2: enter the code plus a new key (min 12 characters). The old key stops working immediately.</div>
+    <button class="load" id="send-code-btn" onclick="sendResetCode()">Send code to my Gmail</button>
+    <input id="reset-code" inputmode="numeric" placeholder="6-digit code" autocomplete="off" style="display:none">
+    <input id="reset-key" type="password" placeholder="New admin key (min 12 characters)" autocomplete="off" style="display:none">
+    <button class="go" id="reset-btn" style="width:100%;display:none" onclick="doReset()">Set new key</button>
+    <div id="forgot-msg" style="margin-top:8px"></div>
   </div>
 
   <div class="card">
@@ -128,6 +139,38 @@ async function act(id, what){
   }catch(e){ alert(e.message); }
 }
 try{ const k = key(); if(k){ document.getElementById('key').value = k; load(); } }catch(e){}
+function fmsg(t, ok){ document.getElementById('forgot-msg').innerHTML = '<span class="'+(ok?'ok':'bad')+'">'+esc(t)+'</span>'; }
+function showForgot(e){ e.preventDefault(); const b=document.getElementById('forgot-box'); b.style.display = b.style.display==='none' ? '' : 'none'; }
+async function sendResetCode(){
+  fmsg('Sending…', true);
+  try{
+    const r = await fetch('/api/admin/forgot', {method:'POST', headers:{'Content-Type':'application/json'}});
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(j.error || ('HTTP '+r.status));
+    fmsg('Code sent — check your Gmail (also Spam). It expires in 10 minutes.', true);
+    document.getElementById('reset-code').style.display='';
+    document.getElementById('reset-key').style.display='';
+    document.getElementById('reset-btn').style.display='';
+    document.getElementById('send-code-btn').textContent='Resend code';
+  }catch(e){ fmsg(e.message, false); }
+}
+async function doReset(){
+  const code = document.getElementById('reset-code').value.trim();
+  const newKey = document.getElementById('reset-key').value;
+  if(!/^\d{6}$/.test(code)){ fmsg('Enter the 6-digit code from your email.', false); return; }
+  if(newKey.length < 12){ fmsg('New key must be at least 12 characters.', false); return; }
+  fmsg('Setting new key…', true);
+  try{
+    const r = await fetch('/api/admin/reset', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({code, newKey})});
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(j.error || ('HTTP '+r.status));
+    try{ sessionStorage.setItem('pp_admin_key', newKey); }catch(e){}
+    document.getElementById('key').value = newKey;
+    document.getElementById('forgot-box').style.display='none';
+    msg('New key is set — old key no longer works.', true);
+    load();
+  }catch(e){ fmsg(e.message, false); }
+}
 </script>
 </body>
 </html>
